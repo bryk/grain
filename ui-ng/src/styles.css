@@ -398,9 +398,19 @@ body {
 .shell-workspace {
   grid-area: main;
   display: flex;
+  flex-direction: column;
   min-height: 0;
   min-width: 0;
   overflow: hidden;
+}
+
+/* The stage and the Director drawer, side by side under the shell's
+   disconnected banner (shell/disconnected-banner.component.ts). */
+.shell-workspace-row {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  min-width: 0;
 }
 
 .main-stage {

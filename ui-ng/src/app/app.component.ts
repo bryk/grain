@@ -67,6 +67,7 @@ import { CustomizeNavDialogComponent } from "./shell/customize-nav-dialog.compon
 import { HelpDialogComponent } from "./shell/help-dialog.component";
 import { type Destination, SETTINGS, hrefFor } from "./shell/nav";
 import { DispatchBannerComponent } from "./shell/dispatch-banner.component";
+import { DisconnectedBannerComponent } from "./shell/disconnected-banner.component";
 import { NavProgressComponent } from "./shell/nav-progress.component";
 import { NextUpComponent } from "./shell/next-up.component";
 import { SnackbarComponent } from "./shell/snackbar.component";
@@ -163,6 +164,7 @@ export class DeferErrorDirective implements OnInit {
     NavProgressComponent,
     NextUpComponent,
     DispatchBannerComponent,
+    DisconnectedBannerComponent,
     HelpDialogComponent,
     AccountPopoverComponent,
     CustomizeNavDialogComponent,
@@ -653,27 +655,30 @@ export class DeferErrorDirective implements OnInit {
       </header>
 
       <div class="shell-workspace">
-        <main
-          class="main-stage"
-          id="main"
-          [attr.inert]="modalOpen() ? '' : null"
-        >
-          @defer (when dispatchBanner()) {
-            @if (dispatchBanner(); as db) {
-              <g-dispatch-banner [banner]="db" />
+        <g-disconnected-banner />
+        <div class="shell-workspace-row">
+          <main
+            class="main-stage"
+            id="main"
+            [attr.inert]="modalOpen() ? '' : null"
+          >
+            @defer (when dispatchBanner()) {
+              @if (dispatchBanner(); as db) {
+                <g-dispatch-banner [banner]="db" />
+              }
+            }
+            <router-outlet />
+          </main>
+          @defer (when directorCtx.isOpen()) {
+            @if (directorCtx.isOpen()) {
+              <g-director-drawer />
+            }
+          } @error {
+            @if (directorCtx.isOpen()) {
+              <span gDeferError (recover)="onDeferError('director')"></span>
             }
           }
-          <router-outlet />
-        </main>
-        @defer (when directorCtx.isOpen()) {
-          @if (directorCtx.isOpen()) {
-            <g-director-drawer />
-          }
-        } @error {
-          @if (directorCtx.isOpen()) {
-            <span gDeferError (recover)="onDeferError('director')"></span>
-          }
-        }
+        </div>
       </div>
 
       <footer class="bottom-bar" [attr.inert]="modalOpen() ? '' : null">

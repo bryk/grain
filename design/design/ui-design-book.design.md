@@ -168,6 +168,18 @@ do not pull in an icon font.
   `Details (N)` breakdown, paired with status on the topbar live pill and
   contextual queue/settings notices formatted in the configured or local
   timezone with relative countdowns.
+- **Disconnected banner:** when the daemon stops answering, a
+  `warning-container` strip (`shell/disconnected-banner.component.ts`) sits
+  across the top of the workspace, above the stage and the Director drawer
+  and outside the subtree a modal makes inert. `services/connection.service.ts`
+  watches every `/api/` request through an HTTP interceptor: two refusals in
+  a row (status 0, or a gateway's non-JSON 502/503/504), or one request
+  unanswered for 10 seconds while a probe sent halfway through goes
+  unanswered too, raise it; any answer from the daemon, error statuses
+  included, clears it without a reload. Its `role="status"` region is always
+  in the page so the text arriving is announced, and it says when the outage
+  began rather than how long ago. Page data stays on screen beneath it
+  (`ui-ng/e2e/next-disconnected-banner.spec.js`).
 
 ### Destinations fill the stage
 
