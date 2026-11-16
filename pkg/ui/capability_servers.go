@@ -1355,9 +1355,20 @@ type CapabilityServerRetrier interface {
 	Retry(capabilityID string) bool
 }
 
+// CapabilityServerReattacher is an alternate single-method interface for
+// registries implementing Reattach(capabilityID) (servers.Registry.Reattach).
+type CapabilityServerReattacher interface {
+	Reattach(capabilityID string)
+}
+
 func (c *Client) retryCapabilityServer(id string) {
+	id = strings.TrimSpace(id)
 	if ret, ok := c.Config.CapabilityServers.(CapabilityServerRetrier); ok {
-		ret.Retry(strings.TrimSpace(id))
+		ret.Retry(id)
+		return
+	}
+	if ra, ok := c.Config.CapabilityServers.(CapabilityServerReattacher); ok {
+		ra.Reattach(id)
 	}
 }
 

@@ -50,6 +50,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ai-on-gke/grain/pkg/authfix"
 	"github.com/ai-on-gke/grain/pkg/capability/intree"
 	"github.com/ai-on-gke/grain/pkg/capability/protocol"
 	"github.com/ai-on-gke/grain/pkg/hostd"
@@ -404,7 +405,7 @@ func (r *Registry) Retry(capabilityID string) bool {
 		}
 	}
 	retried := false
-	if ok && !e.cfg.Disabled && e.state != Attached && e.state != Disabled {
+	if ok && !e.cfg.Disabled && e.state != Disabled && (e.state != Attached || (e.server != nil && e.server.Ended())) {
 		e.retryNow = true
 		retried = true
 	}
@@ -416,6 +417,12 @@ func (r *Registry) Retry(capabilityID string) bool {
 		}
 	}
 	return retried
+}
+
+// Reattach wakes the registry to retry an unattached (or ended) enabled
+// entry on the next Sync, even when its stored ServerConfig has not changed.
+func (r *Registry) Reattach(capabilityID string) {
+	r.Retry(capabilityID)
 }
 
 // CallTool calls one of capabilityID's control-plane tools
@@ -680,7 +687,12 @@ func (r *Registry) attach(ctx context.Context, id string, cfg protocol.ServerCon
 		var waiting string
 		var we *protocol.WaitingError
 		if isConfigure && errors.As(err, &we) {
-			waiting = we.Waiting
+			waiting = Scrub(we.Waiting, resolved.values())
+		}
+		if waiting == "" && cfg.Stdio() {
+			if af, ok := authfix.As(authfix.Wrap(err, msg, cfg.Command)); ok {
+				waiting = Scrub(authfixWaiting(af.Fix), resolved.values())
+			}
 		}
 		hostBuiltinNoConfig := false
 		if b, ok := intree.BuiltinNamed(cfg.Builtin); ok && b.HostOnly && !b.NeedsConfig && len(cfg.Config) == 0 {
@@ -694,26 +706,27 @@ func (r *Registry) attach(ctx context.Context, id string, cfg protocol.ServerCon
 		r.set(id, func(e *entry) {
 			prevState, prevErr = e.state, e.err
 			e.retryNow = false
-			// A built-in refused before anybody configured it, or for its
-			// configuration, is waiting to be configured, not broken. One
-			// in the daemon's own environment that exited before it
-			// answered is broken, configured or not: every built-in comes
-			// up unconfigured, so a fault here is one no configuring
-			// fixes, and needs-config would keep it out of `grain health`.
+			// A built-in refused before anybody configured it, for its
+			// configuration, or while waiting on renewed host credentials is
+			// waiting rather than broken. One in the daemon's own environment
+			// that exited before it answered is broken, configured or not:
+			// every built-in comes up unconfigured, so a fault here is one no
+			// configuring fixes, and needs-config would keep it out of
+			// `grain health`.
 			//
 			// Likewise, an entry that already attached under this very
 			// ServerConfig and Identity (!e.attached.IsZero()) has a
 			// working configuration: if a later process recycle or refresh
-			// fails without protocol.Waiting, something outside Settings
-			// broke (a host mount unmounted or returning ENOKEY, a service
-			// unreachable), so mark it Failed and keep retrying it rather
-			// than parking it in NeedsConfig with retries off.
+			// fails without protocol.Waiting (or authfix), something outside
+			// Settings broke (a host mount unmounted, a service unreachable),
+			// so mark it Failed and keep retrying it rather than parking it in
+			// NeedsConfig with retries off.
 			state = Failed
 			if cfg.Builtin != "" && (waiting != "" || (e.attached.IsZero() && (isConfigure || (len(cfg.Config) == 0 && !(exited && !cfg.OnHost()))))) {
 				state = NeedsConfig
 			}
-			e.state, e.err, e.tried, e.schema = state, msg, now, schema
-			e.hostRetry = state == NeedsConfig && cfg.OnHost() && (!isConfigure || hostBuiltinNoConfig)
+			e.state, e.err, e.tried, e.schema, e.server = state, msg, now, schema, nil
+			e.hostRetry = state == NeedsConfig && waiting == "" && cfg.OnHost() && (!isConfigure || hostBuiltinNoConfig)
 			e.waiting = ""
 			if state == NeedsConfig {
 				e.waiting = waiting
@@ -759,7 +772,7 @@ func (r *Registry) attach(ctx context.Context, id string, cfg protocol.ServerCon
 				nextState = Failed
 				msg = "attached with no methods after previously serving methods"
 			}
-			e.state, e.err, e.tried, e.schema, e.hostRetry, e.configRefused, e.waiting = nextState, msg, now, schema, false, false, ""
+			e.state, e.err, e.tried, e.schema, e.server, e.hostRetry, e.configRefused, e.waiting = nextState, msg, now, schema, nil, false, false, ""
 			dropped = e.wasAttached && prevState != nextState
 			st = e.status(id)
 		})
@@ -791,6 +804,23 @@ func (r *Registry) attach(ctx context.Context, id string, cfg protocol.ServerCon
 	if r.opts.OnAttach != nil {
 		r.opts.OnAttach(id)
 	}
+}
+
+// authfixWaiting turns a matched host-credential Fix into a single-line
+// waiting phrase for Status.Waiting.
+func authfixWaiting(fix authfix.Fix) string {
+	w := fix.Action
+	if strings.TrimSpace(w) == "" {
+		w = fix.Summary
+	}
+	if strings.TrimSpace(w) == "" {
+		w = fix.Reason
+	}
+	w = strings.Join(strings.Fields(w), " ")
+	if w == "" {
+		return "renewed host credentials"
+	}
+	return w
 }
 
 // waitingLabel is how a server's waiting phrase reads in a log line, an
@@ -916,7 +946,7 @@ func (r *Registry) Run(ctx context.Context, tick time.Duration) {
 			servers = r.applied
 		}
 		r.mu.RUnlock()
-		if !ok {
+		if !ok && servers == nil {
 			// Nothing has said what is configured yet.
 			continue
 		}
