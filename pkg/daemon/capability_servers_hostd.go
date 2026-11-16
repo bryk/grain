@@ -534,27 +534,28 @@ func (h *hostdCapabilityServers) rotateManaged(capabilityID string) ([]string, e
 	return reg.RotateManaged(canonicalID)
 }
 
-func (h *hostdCapabilityServers) reattach(capabilityID string) {
-	if h == nil {
-		return
-	}
-	if h.base != nil {
-		h.base.Reattach(capabilityID)
+func (h *hostdCapabilityServers) retry(capabilityID string) bool {
+	if h == nil || h.live == nil {
+		return h.base.Retry(capabilityID)
 	}
 	h.mu.Lock()
 	placed := h.configured
-	regs := make([]*servers.Registry, 0, len(h.regs))
-	for _, r := range h.regs {
-		regs = append(regs, r.reg)
-	}
 	h.mu.Unlock()
-	target := capabilityID
-	if canonicalID, _, ok := placedEntry(placed, capabilityID); ok {
-		target = canonicalID
+	canonicalID, entry, ok := placedEntry(placed, capabilityID)
+	if !ok {
+		return h.base.Retry(capabilityID)
 	}
-	for _, reg := range regs {
-		reg.Reattach(target)
+	ctx, cancel := context.WithTimeout(h.ctx, placedStatusTimeout)
+	defer cancel()
+	route, err := resolveHostdSelector(ctx, h.live(), h.store, string(entry.Hostd))
+	if err != nil {
+		return false
 	}
+	reg, err := h.registry(ctx, route.Name, route.Exec.hostdClient())
+	if err != nil {
+		return false
+	}
+	return reg.Retry(canonicalID)
 }
 
 // placedStatusRegistry is the deployment's registry as Settings and
@@ -616,10 +617,13 @@ func (r placedStatusRegistry) RotateManaged(capabilityID string) ([]string, erro
 	return r.Registry.RotateManaged(capabilityID)
 }
 
-func (r placedStatusRegistry) Reattach(capabilityID string) {
+func (r placedStatusRegistry) Retry(capabilityID string) bool {
 	if r.placed != nil {
-		r.placed.reattach(capabilityID)
-		return
+		return r.placed.retry(capabilityID)
 	}
-	r.Registry.Reattach(capabilityID)
+	return r.Registry.Retry(capabilityID)
+}
+
+func (r placedStatusRegistry) Reattach(capabilityID string) {
+	r.Retry(capabilityID)
 }

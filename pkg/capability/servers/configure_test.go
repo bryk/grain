@@ -18,12 +18,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/ai-on-gke/grain/pkg/authfix/authfixtest"
+	"github.com/ai-on-gke/grain/pkg/capability/intree"
 	"github.com/ai-on-gke/grain/pkg/capability/protocol"
 )
 
@@ -486,10 +488,233 @@ func TestAWaitingConfigureRefusalIsRetriedUntilItAttaches(t *testing.T) {
 	}
 }
 
-// A built-in that already attached under its current ServerConfig and later
-// exits while an external dependency temporarily fails configure (without
-// wrapping in protocol.WaitingError) is retried every RetryInterval rather
-// than stranded in NeedsConfig waiting for an edit to an unchanged config.
+// A built-in that already attached under its current ServerConfig and
+// Identity (such as citc on hostd before its 24h process recycle) has a
+// working configuration: if re-attaching after its process ends fails in
+// configure without protocol.Waiting (for example /google/src/cloud
+// returning ENOKEY while host credentials are expired), it is marked
+// Failed rather than parked in NeedsConfig, retried every RetryInterval,
+// and re-attached automatically once the host recovers.
+func TestAPreviouslyAttachedBuiltinWhoseProcessRecycleFailsConfigureIsFailedAndRetried(t *testing.T) {
+	const citcID = "https://grain.dev/capabilities/citc"
+	var (
+		mu       sync.Mutex
+		refuse   string
+		last     *waitingCaller
+		attaches int
+	)
+	h := &waitingHarness{}
+	attach := func(ctx context.Context, id string, cfg protocol.ServerConfig, secrets protocol.SecretLookup, _ protocol.DialOptions) (*protocol.Server, error) {
+		mu.Lock()
+		attaches++
+		h.mu.Lock()
+		h.refuse = refuse
+		h.mu.Unlock()
+		c := &waitingCaller{fakeCaller: fakeCaller{methods: []string{"workspace", "submit", "probe"}}, h: h}
+		last = c
+		mu.Unlock()
+		return protocol.AttachCaller(ctx, id, cfg, secrets, c)
+	}
+
+	now := time.Date(2026, 11, 13, 16, 25, 32, 0, time.UTC)
+	var drops []Status
+	var onAttaches []string
+	r := New(Options{
+		Attach:        attach,
+		Now:           func() time.Time { return now },
+		RetryInterval: time.Minute,
+		OnDrop:        func(st Status) { drops = append(drops, st) },
+		OnAttach:      func(id string) { onAttaches = append(onAttaches, id) },
+	})
+	ctx := context.Background()
+	servers := map[string]protocol.ServerConfig{
+		citcID: {Builtin: "citc", Command: "grain-citc", Run: protocol.RunHost},
+	}
+
+	r.Sync(ctx, servers)
+	if st := r.Statuses()[0]; st.State != Attached || st.Dropped {
+		t.Fatalf("initial status = %+v, want attached", st)
+	}
+	if len(onAttaches) != 1 {
+		t.Fatalf("onAttaches = %v, want 1", onAttaches)
+	}
+
+	// 24 hours later hostd recycles the process while /google/src/cloud is unavailable.
+	now = now.Add(24 * time.Hour)
+	mu.Lock()
+	refuse = "citc offers no method until this is fixed: the CitC mount /google/src/cloud is not available on this host (is srcfsd running?)"
+	last.mu.Lock()
+	last.ended = true
+	last.mu.Unlock()
+	mu.Unlock()
+
+	r.Sync(ctx, servers)
+	st := r.Statuses()[0]
+	if st.State != Failed || st.ConfigRefused || !st.Dropped || st.ConfigSchema == nil || !strings.Contains(st.Error, "/google/src/cloud") {
+		t.Fatalf("status after recycle drop = %+v, want Failed with Dropped=true, ConfigRefused=false, schema and error kept", st)
+	}
+	if _, err := r.Lookup(citcID); err == nil || strings.Contains(err.Error(), "needs configuring") {
+		t.Errorf("Lookup = %v, want not-attached error rather than needs-configuring", err)
+	}
+	if len(drops) != 1 || drops[0].State != Failed {
+		t.Fatalf("drops = %+v, want one Failed drop", drops)
+	}
+
+	// Before RetryInterval, Sync does not retry; after RetryInterval, it retries without re-raising OnDrop.
+	now = now.Add(30 * time.Second)
+	r.Sync(ctx, servers)
+	if h.calls() != 2 {
+		t.Errorf("retried before RetryInterval: %d configures, want 2", h.calls())
+	}
+	now = now.Add(31 * time.Second)
+	r.Sync(ctx, servers)
+	if h.calls() != 3 {
+		t.Errorf("not retried after RetryInterval: %d configures, want 3", h.calls())
+	}
+	if len(drops) != 1 {
+		t.Errorf("unchanged failure re-raised OnDrop (%d drops)", len(drops))
+	}
+
+	// Once gcert / srcfsd restores /google/src/cloud, the next minute tick re-attaches automatically.
+	mu.Lock()
+	refuse = ""
+	mu.Unlock()
+	now = now.Add(time.Minute)
+	r.Sync(ctx, servers)
+	if st := r.Statuses()[0]; st.State != Attached || st.Dropped || st.Error != "" {
+		t.Fatalf("status after host recovery = %+v, want attached", st)
+	}
+	if len(onAttaches) != 2 {
+		t.Errorf("onAttaches = %v, want OnAttach fired to clear the alert", onAttaches)
+	}
+}
+
+// A HostOnly built-in that requires no operator configuration
+// (NeedsConfig: false) whose configure refuses on cold daemon start because
+// its host mount is not ready yet is retried every RetryInterval rather
+// than waiting forever for a Settings edit.
+func TestAHostOnlyZeroConfigBuiltinRefusedAtColdStartIsRetried(t *testing.T) {
+	const name = "test-host-mount"
+	intree.Register(intree.Builder{
+		Name:        name,
+		Summary:     "test host-only workspace server",
+		Host:        true,
+		HostOnly:    true,
+		NeedsConfig: false,
+		Build: func(context.Context, []string, intree.Env, *log.Logger) (*intree.Server, error) {
+			return nil, errors.New("unused")
+		},
+	})
+	t.Cleanup(func() { intree.Unregister(name) })
+
+	id := intree.CanonicalID(name)
+	h := &waitingHarness{refuse: "host mount /google/src/cloud is not mounted yet"}
+	now := time.Date(2026, 11, 16, 7, 0, 0, 0, time.UTC)
+	var drops []Status
+	r := New(Options{
+		Attach:        h.attach,
+		Now:           func() time.Time { return now },
+		RetryInterval: time.Minute,
+		OnDrop:        func(st Status) { drops = append(drops, st) },
+	})
+	ctx := context.Background()
+	servers := map[string]protocol.ServerConfig{
+		id: {Builtin: name, Command: intree.HostEntry(name), Run: protocol.RunHost},
+	}
+
+	r.Sync(ctx, servers)
+	if st := r.Statuses()[0]; st.State != NeedsConfig || st.ConfigRefused || st.Dropped {
+		t.Fatalf("cold-start status = %+v, want NeedsConfig without ConfigRefused or Dropped", st)
+	}
+	if len(drops) != 0 {
+		t.Errorf("cold start raised OnDrop: %+v", drops)
+	}
+
+	h.mu.Lock()
+	h.refuse = ""
+	h.mu.Unlock()
+	now = now.Add(time.Minute)
+	r.Sync(ctx, servers)
+	if st := r.Statuses()[0]; st.State != Attached {
+		t.Fatalf("status after RetryInterval = %+v (calls=%d), want attached", st, h.calls())
+	}
+}
+
+// Retry wakes an unattached NeedsConfig entry even when its stored
+// ServerConfig has not changed, without firing duplicate OnDrop alerts if
+// the refusal still holds.
+func TestRetryReattachesUnchangedNeedsConfigWithoutDuplicateDrops(t *testing.T) {
+	h := &configHarness{failWith: "role ceiling exceeded"}
+	var drops []Status
+	var attaches []string
+	r := New(Options{
+		Attach:   h.attach,
+		Secrets:  func(name string) (string, bool) { return secretValue, name == "tok" },
+		OnDrop:   func(st Status) { drops = append(drops, st) },
+		OnAttach: func(id string) { attaches = append(attaches, id) },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfg := map[string]protocol.ServerConfig{
+		gcp: {Builtin: "gcp", Command: "grain", Config: map[string]any{"project": "p1", "token": "$secret:tok"}},
+	}
+	r.Update(cfg)
+	done := make(chan struct{})
+	go func() { r.Run(ctx, time.Hour); close(done) }()
+	defer func() { cancel(); <-done }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if st := r.Statuses(); len(st) == 1 && st[0].State == NeedsConfig {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for initial NeedsConfig: %+v", r.Statuses())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Note: cfg references $secret:tok; also verify Retry on a config with no secret refs.
+	noSecretID := "https://grain.dev/capabilities/host-script"
+	hNoSecret := &waitingHarness{refuse: "external check failed"}
+	var nsDrops []Status
+	rNoSecret := New(Options{
+		Attach: hNoSecret.attach,
+		OnDrop: func(st Status) { nsDrops = append(nsDrops, st) },
+	})
+	nsCfg := map[string]protocol.ServerConfig{
+		noSecretID: {Builtin: "host-script", Command: "grain", Config: map[string]any{"scripts": []any{}}},
+	}
+	rNoSecret.Sync(context.Background(), nsCfg)
+	if len(nsDrops) != 1 || hNoSecret.calls() != 1 {
+		t.Fatalf("initial Sync: drops=%d calls=%d, want 1 each", len(nsDrops), hNoSecret.calls())
+	}
+	if !rNoSecret.Retry(noSecretID) {
+		t.Fatal("Retry(NeedsConfig) = false, want true")
+	}
+	rNoSecret.Sync(context.Background(), nsCfg)
+	if hNoSecret.calls() != 2 || len(nsDrops) != 1 {
+		t.Fatalf("after Retry while still failing: calls=%d drops=%d, want 2 calls and 1 drop", hNoSecret.calls(), len(nsDrops))
+	}
+
+	hNoSecret.mu.Lock()
+	hNoSecret.refuse = ""
+	hNoSecret.mu.Unlock()
+	if !rNoSecret.Retry(noSecretID) {
+		t.Fatal("second Retry(NeedsConfig) = false, want true")
+	}
+	rNoSecret.Sync(context.Background(), nsCfg)
+	if st := rNoSecret.Statuses()[0]; st.State != Attached {
+		t.Fatalf("after Retry once fixed: status = %+v, want Attached", st)
+	}
+	if rNoSecret.Retry(noSecretID) {
+		t.Error("Retry on an already Attached server = true, want false")
+	}
+	_ = attaches
+}
+
+// A built-in that already attached with empty Config and later exits while
+// configure temporarily fails without WaitingError fires OnDrop once,
+// retries after RetryInterval, and re-attaches once the failure clears.
 func TestPreviouslyAttachedServerWhoseReattachConfigureFailsIsRetried(t *testing.T) {
 	h := &waitingHarness{}
 	now := time.Date(2026, 11, 16, 9, 0, 0, 0, time.UTC)
@@ -523,24 +748,19 @@ func TestPreviouslyAttachedServerWhoseReattachConfigureFailsIsRetried(t *testing
 	now = now.Add(24 * time.Hour)
 	r.Sync(ctx, servers)
 	st := r.Statuses()[0]
-	if st.State != NeedsConfig || st.ConfigRefused || st.Error != "" || !strings.Contains(st.Reason, "temporarily unavailable") {
-		t.Fatalf("after process exit with failing configure: status = %+v, want needs-config with reason and ConfigRefused=false", st)
+	if st.State != Failed || st.ConfigRefused || !strings.Contains(st.Error, "temporarily unavailable") {
+		t.Fatalf("after process exit with failing configure: status = %+v, want Failed with error and ConfigRefused=false", st)
 	}
 	if len(drops) != 1 {
 		t.Fatalf("drops after first re-attach failure = %+v, want 1", drops)
 	}
-	if n := h.calls(); n != 2 {
-		t.Fatalf("configure calls = %d, want 2", n)
-	}
 
-	// Not due yet: no retry before RetryInterval.
 	now = now.Add(30 * time.Second)
 	r.Sync(ctx, servers)
 	if n := h.calls(); n != 2 {
 		t.Fatalf("retried before RetryInterval: %d configures", n)
 	}
 
-	// Due after RetryInterval, still failing: retried, OnDrop not spammed.
 	now = now.Add(31 * time.Second)
 	r.Sync(ctx, servers)
 	if n := h.calls(); n != 3 {
@@ -550,13 +770,12 @@ func TestPreviouslyAttachedServerWhoseReattachConfigureFailsIsRetried(t *testing
 		t.Errorf("OnDrop fired %d times on unchanged retry, want 1", len(drops))
 	}
 
-	// Once the external failure clears, the next retry re-attaches and fires OnAttach.
 	h.mu.Lock()
 	h.refuse = ""
 	h.mu.Unlock()
 	now = now.Add(time.Minute)
 	r.Sync(ctx, servers)
-	if st := r.Statuses()[0]; st.State != Attached || st.Reason != "" || st.Error != "" {
+	if st := r.Statuses()[0]; st.State != Attached || st.Error != "" {
 		t.Fatalf("status after recovery = %+v, want attached", st)
 	}
 	if len(attaches) != 2 {
@@ -565,7 +784,8 @@ func TestPreviouslyAttachedServerWhoseReattachConfigureFailsIsRetried(t *testing
 }
 
 // An attach or configure failure recognized by a registered pkg/authfix
-// classifier enters Waiting automatically and retries every RetryInterval.
+// classifier enters Waiting (NeedsConfig with Waiting populated) both on
+// cold startup and after a process recycle, and retries every RetryInterval.
 func TestAuthfixClassifiedAttachFailureWaitsAndRetries(t *testing.T) {
 	authfixtest.Register(t)
 	h := &waitingHarness{refuse: "fork/exec /opt/bin/citc: " + authfixtest.Reason}
@@ -580,11 +800,11 @@ func TestAuthfixClassifiedAttachFailureWaitsAndRetries(t *testing.T) {
 		OnAttach:      func(id string) { attaches = append(attaches, id) },
 	})
 	ctx := context.Background()
-	servers := map[string]protocol.ServerConfig{gcp: {Builtin: "citc", Command: "grain"}}
+	servers := map[string]protocol.ServerConfig{gcp: {Builtin: "citc", Command: "grain-citc", Run: protocol.RunHost}}
 	r.Sync(ctx, servers)
 	st := r.Statuses()[0]
 	if st.State != NeedsConfig || st.Waiting != authfixtest.Action || st.ConfigRefused || !strings.Contains(st.Reason, authfixtest.Reason) {
-		t.Fatalf("status = %+v, want needs-config with authfix Waiting=%q and Reason", st, authfixtest.Action)
+		t.Fatalf("cold-start status = %+v, want needs-config with authfix Waiting=%q and Reason", st, authfixtest.Action)
 	}
 	if len(drops) != 1 || drops[0].Waiting != authfixtest.Action {
 		t.Fatalf("drops = %+v, want 1 drop carrying Waiting", drops)
@@ -616,6 +836,22 @@ func TestAuthfixClassifiedAttachFailureWaitsAndRetries(t *testing.T) {
 	if len(attaches) != 1 {
 		t.Errorf("attaches = %v, want 1", attaches)
 	}
+
+	// If credentials expire again before a later 24h process recycle, re-attach
+	// also enters Waiting rather than generic Failed.
+	h.mu.Lock()
+	attachedCaller := h.callers[len(h.callers)-1]
+	h.refuse = "fork/exec /opt/bin/citc: " + authfixtest.Reason
+	h.mu.Unlock()
+	attachedCaller.mu.Lock()
+	attachedCaller.ended = true
+	attachedCaller.mu.Unlock()
+
+	now = now.Add(24 * time.Hour)
+	r.Sync(ctx, servers)
+	if st := r.Statuses()[0]; st.State != NeedsConfig || st.Waiting != authfixtest.Action {
+		t.Fatalf("post-recycle authfix status = %+v, want needs-config with Waiting=%q", st, authfixtest.Action)
+	}
 }
 
 func TestReattachRetriesUnchangedNeedsConfigEntry(t *testing.T) {
@@ -635,7 +871,6 @@ func TestReattachRetriesUnchangedNeedsConfigEntry(t *testing.T) {
 		t.Fatalf("initial status = %+v (%d calls), want NeedsConfig after 1 call", st, h.calls())
 	}
 
-	// Without Reattach, an unchanged Sync does not retry a never-attached NeedsConfig entry.
 	h.mu.Lock()
 	h.refuse = ""
 	h.mu.Unlock()
@@ -645,7 +880,6 @@ func TestReattachRetriesUnchangedNeedsConfigEntry(t *testing.T) {
 		t.Fatalf("unchanged Sync retried without Reattach: status=%+v calls=%d", st, h.calls())
 	}
 
-	// Reattach marks the entry Pending and wakes Run, attaching immediately on the next Sync.
 	done := make(chan struct{})
 	go func() { r.Run(ctx, time.Hour); close(done) }()
 	r.Reattach(gcp)
@@ -662,13 +896,6 @@ func TestReattachRetriesUnchangedNeedsConfigEntry(t *testing.T) {
 	}
 	if n := h.calls(); n != 2 {
 		t.Errorf("configure calls after Reattach = %d, want 2", n)
-	}
-
-	// Reattach on an already-attached healthy entry is a no-op.
-	r.Reattach(gcp)
-	r.Sync(ctx, servers)
-	if st := r.Statuses(); len(st) != 1 || st[0].State != Attached || h.calls() != 2 {
-		t.Errorf("Reattach on healthy server: status=%+v calls=%d, want Attached with 2 calls", st, h.calls())
 	}
 	cancel()
 	<-done
