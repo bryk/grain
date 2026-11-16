@@ -687,10 +687,10 @@ func (r *Registry) attach(ctx context.Context, id string, cfg protocol.ServerCon
 		var waiting string
 		var we *protocol.WaitingError
 		if isConfigure && errors.As(err, &we) {
-			waiting = we.Waiting
+			waiting = Scrub(we.Waiting, resolved.values())
 		}
-		if waiting == "" {
-			if af, ok := authfix.As(authfix.Wrap(err, errText, cfg.Command)); ok {
+		if waiting == "" && cfg.Stdio() {
+			if af, ok := authfix.As(authfix.Wrap(err, msg, cfg.Command)); ok {
 				waiting = Scrub(authfixWaiting(af.Fix), resolved.values())
 			}
 		}
@@ -727,7 +727,10 @@ func (r *Registry) attach(ctx context.Context, id string, cfg protocol.ServerCon
 			}
 			e.state, e.err, e.tried, e.schema, e.server = state, msg, now, schema, nil
 			e.hostRetry = state == NeedsConfig && waiting == "" && cfg.OnHost() && (!isConfigure || hostBuiltinNoConfig)
-			e.waiting = waiting
+			e.waiting = ""
+			if state == NeedsConfig {
+				e.waiting = waiting
+			}
 			// A server waiting on something outside grain has not refused
 			// its config, but is out of use all the same: it is raised
 			// so somebody renews what it waits for.
@@ -769,7 +772,7 @@ func (r *Registry) attach(ctx context.Context, id string, cfg protocol.ServerCon
 				nextState = Failed
 				msg = "attached with no methods after previously serving methods"
 			}
-			e.state, e.err, e.tried, e.schema, e.hostRetry, e.configRefused, e.waiting = nextState, msg, now, schema, false, false, ""
+			e.state, e.err, e.tried, e.schema, e.server, e.hostRetry, e.configRefused, e.waiting = nextState, msg, now, schema, nil, false, false, ""
 			dropped = e.wasAttached && prevState != nextState
 			st = e.status(id)
 		})

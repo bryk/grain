@@ -535,7 +535,10 @@ func (h *hostdCapabilityServers) rotateManaged(capabilityID string) ([]string, e
 }
 
 func (h *hostdCapabilityServers) retry(capabilityID string) bool {
-	if h == nil || h.live == nil {
+	if h == nil {
+		return false
+	}
+	if h.live == nil {
 		return h.base.Retry(capabilityID)
 	}
 	h.mu.Lock()
