@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ai-on-gke/grain/pkg/authfix/authfixtest"
 	"github.com/ai-on-gke/grain/pkg/capability/protocol"
 )
 
@@ -369,6 +370,7 @@ type waitingHarness struct {
 	waiting   string
 	refuse    string
 	configure int
+	callers   []*waitingCaller
 }
 
 func (c *waitingCaller) ListTools(ctx context.Context) ([]protocol.Tool, error) {
@@ -396,7 +398,11 @@ func (c *waitingCaller) CallTool(_ context.Context, name string, _ map[string]an
 }
 
 func (h *waitingHarness) attach(ctx context.Context, id string, cfg protocol.ServerConfig, secrets protocol.SecretLookup, _ protocol.DialOptions) (*protocol.Server, error) {
-	return protocol.AttachCaller(ctx, id, cfg, secrets, &waitingCaller{fakeCaller: fakeCaller{methods: []string{"key"}}, h: h})
+	c := &waitingCaller{fakeCaller: fakeCaller{methods: []string{"key"}}, h: h}
+	h.mu.Lock()
+	h.callers = append(h.callers, c)
+	h.mu.Unlock()
+	return protocol.AttachCaller(ctx, id, cfg, secrets, c)
 }
 
 func (h *waitingHarness) calls() int {
@@ -478,4 +484,192 @@ func TestAWaitingConfigureRefusalIsRetriedUntilItAttaches(t *testing.T) {
 	if st := r2.Statuses()[0]; st.State != NeedsConfig || st.Waiting != "" || h2.calls() != 1 {
 		t.Errorf("plain refusal: status %+v after %d configures, want needs-config tried once", st, h2.calls())
 	}
+}
+
+// A built-in that already attached under its current ServerConfig and later
+// exits while an external dependency temporarily fails configure (without
+// wrapping in protocol.WaitingError) is retried every RetryInterval rather
+// than stranded in NeedsConfig waiting for an edit to an unchanged config.
+func TestPreviouslyAttachedServerWhoseReattachConfigureFailsIsRetried(t *testing.T) {
+	h := &waitingHarness{}
+	now := time.Date(2026, 11, 16, 9, 0, 0, 0, time.UTC)
+	var drops []Status
+	var attaches []string
+	r := New(Options{
+		Attach:        h.attach,
+		Now:           func() time.Time { return now },
+		RetryInterval: time.Minute,
+		OnDrop:        func(st Status) { drops = append(drops, st) },
+		OnAttach:      func(id string) { attaches = append(attaches, id) },
+	})
+	ctx := context.Background()
+	servers := map[string]protocol.ServerConfig{gcp: {Builtin: "citc", Command: "grain"}}
+	r.Sync(ctx, servers)
+	if st := r.Statuses()[0]; st.State != Attached {
+		t.Fatalf("first attach status = %+v, want attached", st)
+	}
+	if len(attaches) != 1 || len(drops) != 0 {
+		t.Fatalf("first attach: attaches=%v drops=%v", attaches, drops)
+	}
+
+	h.mu.Lock()
+	first := h.callers[0]
+	h.refuse = "host daemon temporarily unavailable"
+	h.mu.Unlock()
+	first.mu.Lock()
+	first.ended = true
+	first.mu.Unlock()
+
+	now = now.Add(24 * time.Hour)
+	r.Sync(ctx, servers)
+	st := r.Statuses()[0]
+	if st.State != NeedsConfig || st.ConfigRefused || st.Error != "" || !strings.Contains(st.Reason, "temporarily unavailable") {
+		t.Fatalf("after process exit with failing configure: status = %+v, want needs-config with reason and ConfigRefused=false", st)
+	}
+	if len(drops) != 1 {
+		t.Fatalf("drops after first re-attach failure = %+v, want 1", drops)
+	}
+	if n := h.calls(); n != 2 {
+		t.Fatalf("configure calls = %d, want 2", n)
+	}
+
+	// Not due yet: no retry before RetryInterval.
+	now = now.Add(30 * time.Second)
+	r.Sync(ctx, servers)
+	if n := h.calls(); n != 2 {
+		t.Fatalf("retried before RetryInterval: %d configures", n)
+	}
+
+	// Due after RetryInterval, still failing: retried, OnDrop not spammed.
+	now = now.Add(31 * time.Second)
+	r.Sync(ctx, servers)
+	if n := h.calls(); n != 3 {
+		t.Fatalf("not retried after RetryInterval: %d configures, want 3", n)
+	}
+	if len(drops) != 1 {
+		t.Errorf("OnDrop fired %d times on unchanged retry, want 1", len(drops))
+	}
+
+	// Once the external failure clears, the next retry re-attaches and fires OnAttach.
+	h.mu.Lock()
+	h.refuse = ""
+	h.mu.Unlock()
+	now = now.Add(time.Minute)
+	r.Sync(ctx, servers)
+	if st := r.Statuses()[0]; st.State != Attached || st.Reason != "" || st.Error != "" {
+		t.Fatalf("status after recovery = %+v, want attached", st)
+	}
+	if len(attaches) != 2 {
+		t.Errorf("attaches = %v, want 2", attaches)
+	}
+}
+
+// An attach or configure failure recognized by a registered pkg/authfix
+// classifier enters Waiting automatically and retries every RetryInterval.
+func TestAuthfixClassifiedAttachFailureWaitsAndRetries(t *testing.T) {
+	authfixtest.Register(t)
+	h := &waitingHarness{refuse: "fork/exec /opt/bin/citc: " + authfixtest.Reason}
+	now := time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC)
+	var drops []Status
+	var attaches []string
+	r := New(Options{
+		Attach:        h.attach,
+		Now:           func() time.Time { return now },
+		RetryInterval: time.Minute,
+		OnDrop:        func(st Status) { drops = append(drops, st) },
+		OnAttach:      func(id string) { attaches = append(attaches, id) },
+	})
+	ctx := context.Background()
+	servers := map[string]protocol.ServerConfig{gcp: {Builtin: "citc", Command: "grain"}}
+	r.Sync(ctx, servers)
+	st := r.Statuses()[0]
+	if st.State != NeedsConfig || st.Waiting != authfixtest.Action || st.ConfigRefused || !strings.Contains(st.Reason, authfixtest.Reason) {
+		t.Fatalf("status = %+v, want needs-config with authfix Waiting=%q and Reason", st, authfixtest.Action)
+	}
+	if len(drops) != 1 || drops[0].Waiting != authfixtest.Action {
+		t.Fatalf("drops = %+v, want 1 drop carrying Waiting", drops)
+	}
+
+	now = now.Add(30 * time.Second)
+	r.Sync(ctx, servers)
+	if n := h.calls(); n != 1 {
+		t.Fatalf("retried before RetryInterval: %d configures", n)
+	}
+
+	now = now.Add(31 * time.Second)
+	r.Sync(ctx, servers)
+	if n := h.calls(); n != 2 {
+		t.Fatalf("not retried after RetryInterval: %d configures, want 2", n)
+	}
+	if len(drops) != 1 {
+		t.Errorf("unchanged authfix wait raised %d drops, want 1", len(drops))
+	}
+
+	h.mu.Lock()
+	h.refuse = ""
+	h.mu.Unlock()
+	now = now.Add(time.Minute)
+	r.Sync(ctx, servers)
+	if st := r.Statuses()[0]; st.State != Attached || st.Waiting != "" || st.Reason != "" {
+		t.Fatalf("status after renewing credentials = %+v, want attached", st)
+	}
+	if len(attaches) != 1 {
+		t.Errorf("attaches = %v, want 1", attaches)
+	}
+}
+
+func TestReattachRetriesUnchangedNeedsConfigEntry(t *testing.T) {
+	h := &waitingHarness{refuse: "external service not ready"}
+	now := time.Date(2026, 11, 16, 11, 0, 0, 0, time.UTC)
+	r := New(Options{
+		Attach:        h.attach,
+		Now:           func() time.Time { return now },
+		RetryInterval: time.Minute,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	servers := map[string]protocol.ServerConfig{gcp: {Builtin: "citc", Command: "grain"}}
+
+	r.Sync(ctx, servers)
+	if st := r.Statuses()[0]; st.State != NeedsConfig || h.calls() != 1 {
+		t.Fatalf("initial status = %+v (%d calls), want NeedsConfig after 1 call", st, h.calls())
+	}
+
+	// Without Reattach, an unchanged Sync does not retry a never-attached NeedsConfig entry.
+	h.mu.Lock()
+	h.refuse = ""
+	h.mu.Unlock()
+	now = now.Add(2 * time.Minute)
+	r.Sync(ctx, servers)
+	if st := r.Statuses()[0]; st.State != NeedsConfig || h.calls() != 1 {
+		t.Fatalf("unchanged Sync retried without Reattach: status=%+v calls=%d", st, h.calls())
+	}
+
+	// Reattach marks the entry Pending and wakes Run, attaching immediately on the next Sync.
+	done := make(chan struct{})
+	go func() { r.Run(ctx, time.Hour); close(done) }()
+	r.Reattach(gcp)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if st := r.Statuses(); len(st) == 1 && st[0].State == Attached {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Reattach did not attach the server; status = %+v", r.Statuses())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := h.calls(); n != 2 {
+		t.Errorf("configure calls after Reattach = %d, want 2", n)
+	}
+
+	// Reattach on an already-attached healthy entry is a no-op.
+	r.Reattach(gcp)
+	r.Sync(ctx, servers)
+	if st := r.Statuses(); len(st) != 1 || st[0].State != Attached || h.calls() != 2 {
+		t.Errorf("Reattach on healthy server: status=%+v calls=%d, want Attached with 2 calls", st, h.calls())
+	}
+	cancel()
+	<-done
 }

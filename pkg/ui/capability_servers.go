@@ -618,7 +618,7 @@ func (c *Client) SetCapabilityServer(ctx context.Context, req SetCapabilityServe
 			}
 		}
 	}
-	return c.updateCapabilityServers(ctx, func(m map[string]protocol.ServerConfig) error {
+	if err := c.updateCapabilityServers(ctx, func(m map[string]protocol.ServerConfig) error {
 		if from != "" {
 			old, ok := m[from]
 			if !ok {
@@ -640,7 +640,15 @@ func (c *Client) SetCapabilityServer(ctx context.Context, req SetCapabilityServe
 		}
 		m[id] = cfg
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	if !cfg.Disabled {
+		if ra, ok := c.Config.CapabilityServers.(CapabilityServerReattacher); ok {
+			ra.Reattach(id)
+		}
+	}
+	return nil
 }
 
 // configSecretName is the secret a config field's value is stored under
@@ -1338,6 +1346,13 @@ func (c *Client) DismissCapabilityServerNotice(ctx context.Context, id string) e
 // Rotate action uses (servers.Registry.RotateManaged).
 type CapabilityServerRotator interface {
 	RotateManaged(capabilityID string) ([]string, error)
+}
+
+// CapabilityServerReattacher is the part of the daemon's registry a
+// Settings save uses to try attaching an unattached entry again even
+// when its stored ServerConfig did not change (servers.Registry.Reattach).
+type CapabilityServerReattacher interface {
+	Reattach(capabilityID string)
 }
 
 // RotateCapabilityServerManaged replaces every grain-managed secret of

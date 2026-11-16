@@ -534,6 +534,29 @@ func (h *hostdCapabilityServers) rotateManaged(capabilityID string) ([]string, e
 	return reg.RotateManaged(canonicalID)
 }
 
+func (h *hostdCapabilityServers) reattach(capabilityID string) {
+	if h == nil {
+		return
+	}
+	if h.base != nil {
+		h.base.Reattach(capabilityID)
+	}
+	h.mu.Lock()
+	placed := h.configured
+	regs := make([]*servers.Registry, 0, len(h.regs))
+	for _, r := range h.regs {
+		regs = append(regs, r.reg)
+	}
+	h.mu.Unlock()
+	target := capabilityID
+	if canonicalID, _, ok := placedEntry(placed, capabilityID); ok {
+		target = canonicalID
+	}
+	for _, reg := range regs {
+		reg.Reattach(target)
+	}
+}
+
 // placedStatusRegistry is the deployment's registry as Settings and
 // control-plane callers read it, routing placed run: hostd servers --
 // including Probe and CallTool, so credentials never go to the default
@@ -591,4 +614,12 @@ func (r placedStatusRegistry) RotateManaged(capabilityID string) ([]string, erro
 		return r.placed.rotateManaged(capabilityID)
 	}
 	return r.Registry.RotateManaged(capabilityID)
+}
+
+func (r placedStatusRegistry) Reattach(capabilityID string) {
+	if r.placed != nil {
+		r.placed.reattach(capabilityID)
+		return
+	}
+	r.Registry.Reattach(capabilityID)
 }
