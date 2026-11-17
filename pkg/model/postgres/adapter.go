@@ -782,13 +782,6 @@ var (
 	}
 )
 
-type boolExprReplacer struct {
-	re1   *regexp.Regexp
-	re0   *regexp.Regexp
-	reNe1 *regexp.Regexp
-	reNe0 *regexp.Regexp
-}
-
 type boolDDLReplacer struct {
 	reDef1  *regexp.Regexp
 	reDef0  *regexp.Regexp
@@ -797,21 +790,22 @@ type boolDDLReplacer struct {
 }
 
 var (
-	boolExprReplacers []boolExprReplacer
-	boolDDLReplacers  []boolDDLReplacer
-	boolColumnsSet    = make(map[string]bool)
-	insertValuesRe    = regexp.MustCompile(`(?is)^\s*INSERT\s+INTO\s+([^\s(]+)\s*\(([^)]+)\)\s*VALUES\s*\((.*)\)(.*)$`)
+	reBoolCoalesce0    *regexp.Regexp
+	reBoolCoalesce1    *regexp.Regexp
+	reBoolCoalesceCmp0 *regexp.Regexp
+	reBoolCoalesceCmp1 *regexp.Regexp
+	reBoolCmp0         *regexp.Regexp
+	reBoolCmp1         *regexp.Regexp
+	boolDDLReplacers   []boolDDLReplacer
+	boolColumnsSet     = make(map[string]bool)
+	insertValuesRe     = regexp.MustCompile(`(?is)^\s*INSERT\s+INTO\s+([^\s(]+)\s*\(([^)]+)\)\s*VALUES\s*\((.*)\)(.*)$`)
 )
 
 func init() {
+	escaped := make([]string, 0, len(boolColumns))
 	for _, col := range boolColumns {
 		boolColumnsSet[col] = true
-		boolExprReplacers = append(boolExprReplacers, boolExprReplacer{
-			re1:   regexp.MustCompile(`(?i)(["` + "`" + `]?` + col + `["` + "`" + `]?\s*=\s*)1\b`),
-			re0:   regexp.MustCompile(`(?i)(["` + "`" + `]?` + col + `["` + "`" + `]?\s*=\s*)0\b`),
-			reNe1: regexp.MustCompile(`(?i)(["` + "`" + `]?` + col + `["` + "`" + `]?\s*!=\s*)1\b`),
-			reNe0: regexp.MustCompile(`(?i)(["` + "`" + `]?` + col + `["` + "`" + `]?\s*!=\s*)0\b`),
-		})
+		escaped = append(escaped, regexp.QuoteMeta(col))
 		boolDDLReplacers = append(boolDDLReplacers, boolDDLReplacer{
 			reDef1:  regexp.MustCompile(`(?i)(["` + "`" + `]` + col + `["` + "`" + `]\s+)INTEGER(\s+NOT\s+NULL\s+DEFAULT\s+)1`),
 			reDef0:  regexp.MustCompile(`(?i)(["` + "`" + `]` + col + `["` + "`" + `]\s+)INTEGER(\s+NOT\s+NULL\s+DEFAULT\s+)0`),
@@ -819,6 +813,17 @@ func init() {
 			reDef:   regexp.MustCompile(`(?i)(["` + "`" + `]` + col + `["` + "`" + `]\s+)INTEGER`),
 		})
 	}
+	boolColAlt := "(?:" + strings.Join(escaped, "|") + ")"
+	boolColIdent := `(?:"` + boolColAlt + `"|` + "`" + boolColAlt + "`" + `|\b` + boolColAlt + `\b)`
+	sqlQual := `(?:(?:"[^"]+"|` + "`[^`]+`" + `|\b\w+\b)\s*\.\s*)*`
+	boolCoalesceArgs := `(?:` + sqlQual + boolColIdent + `\s*,\s*)+`
+
+	reBoolCoalesce0 = regexp.MustCompile(`(?i)\b(COALESCE\s*\(\s*` + boolCoalesceArgs + `)0(\s*\))`)
+	reBoolCoalesce1 = regexp.MustCompile(`(?i)\b(COALESCE\s*\(\s*` + boolCoalesceArgs + `)1(\s*\))`)
+	reBoolCoalesceCmp0 = regexp.MustCompile(`(?i)\b(COALESCE\s*\(\s*` + boolCoalesceArgs + `(?:TRUE|FALSE)\s*\)\s*(?:=|!=|<>)\s*)0\b`)
+	reBoolCoalesceCmp1 = regexp.MustCompile(`(?i)\b(COALESCE\s*\(\s*` + boolCoalesceArgs + `(?:TRUE|FALSE)\s*\)\s*(?:=|!=|<>)\s*)1\b`)
+	reBoolCmp0 = regexp.MustCompile(`(?i)(` + sqlQual + boolColIdent + `\s*(?:=|!=|<>)\s*)0\b`)
+	reBoolCmp1 = regexp.MustCompile(`(?i)(` + sqlQual + boolColIdent + `\s*(?:=|!=|<>)\s*)1\b`)
 }
 
 func adaptSqliteFunctions(query string) string {
@@ -849,12 +854,12 @@ func adaptSandboxUsage(query string) string {
 }
 
 func adaptBoolExpressions(query string) string {
-	for _, r := range boolExprReplacers {
-		query = r.re1.ReplaceAllString(query, "${1}TRUE")
-		query = r.re0.ReplaceAllString(query, "${1}FALSE")
-		query = r.reNe1.ReplaceAllString(query, "${1}TRUE")
-		query = r.reNe0.ReplaceAllString(query, "${1}FALSE")
-	}
+	query = reBoolCoalesce0.ReplaceAllString(query, "${1}FALSE${2}")
+	query = reBoolCoalesce1.ReplaceAllString(query, "${1}TRUE${2}")
+	query = reBoolCoalesceCmp0.ReplaceAllString(query, "${1}FALSE")
+	query = reBoolCoalesceCmp1.ReplaceAllString(query, "${1}TRUE")
+	query = reBoolCmp0.ReplaceAllString(query, "${1}FALSE")
+	query = reBoolCmp1.ReplaceAllString(query, "${1}TRUE")
 	return query
 }
 
