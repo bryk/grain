@@ -183,20 +183,28 @@ g-tasks-page .task-row.is-selected .row-title {
   }
 }
 
-g-tasks-page .tasks-detail-pane {
+.tasks-detail-pane {
+  overflow: clip;
+}
+
+.tasks-detail-pane > g-task-detail {
+  display: contents;
+}
+
+.tasks-detail-pane .task-page {
+  flex: 1;
+  min-height: 0;
   overflow: hidden;
 }
 
-g-tasks-page .tasks-detail-pane g-task-detail {
-  display: flex;
-  flex: 1;
-  min-height: 0;
+.tasks-detail-pane .task-page:has(g-task-edit-panel, .compact-card) {
+  overflow-y: auto;
 }
 
-g-tasks-page .tasks-detail-pane .task-page {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
+.tasks-detail-pane
+  .task-page:has(g-task-edit-panel, .compact-card)
+  .task-layout {
+  min-height: 280px;
 }
 
 /* The pane is the task page narrowed: Details is a tab, not a column. */
