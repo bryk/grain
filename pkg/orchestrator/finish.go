@@ -268,6 +268,9 @@ func processResultFrom(ctx context.Context, store *model.Store, reach *gitproxy.
 		if _, err := relayComment(ctx, store, task, nothingNeeded, now); err != nil {
 			return fmt.Errorf("orchestrator: posting nothing_needed reason for %s: %w", task.ID, err)
 		}
+		if isStewardAuditTask(task) {
+			checkAndRecordStewardReportText(ctx, store, task, runID, nothingNeeded, result, now)
+		}
 	}
 
 	// Relayed on every path too, and on top of whatever else the run
@@ -538,6 +541,12 @@ func processResultFrom(ctx context.Context, store *model.Store, reach *gitproxy.
 				o.CompletedAt = nil
 			})
 		}
+		if isStewardAuditTask(task) && (stewardAuditHasFindings(nothingNeeded) || (hasComment && stewardAuditHasFindings(comment))) {
+			return observeField(ctx, store, task.ID, now, func(o *model.Observation) {
+				o.CompletedAt = &now
+				o.RetryRequestedAt = nil
+			})
+		}
 		return finishNothingNeeded(ctx, store, task, runID, now)
 	}
 
@@ -557,7 +566,7 @@ func processResultFrom(ctx context.Context, store *model.Store, reach *gitproxy.
 	// non-code task with a final assistant response (and did not push a branch or
 	// ask a question), use the final assistant text as the closing note.
 	if !relayedInProcess && !hasComment && !hasNothingNeeded && result != nil && strings.TrimSpace(result.FinalText) != "" {
-		comment := strings.TrimSpace(result.FinalText)
+		comment = strings.TrimSpace(result.FinalText)
 		if _, err := relayCommentWithAttachments(ctx, store, task, comment, nil, now); err != nil {
 			return fmt.Errorf("orchestrator: posting closing comment for %s: %w", task.ID, err)
 		}
@@ -616,6 +625,15 @@ func processResultFrom(ctx context.Context, store *model.Store, reach *gitproxy.
 		if fresh != nil && model.ClosesOnAnswer(*fresh) {
 			return finishAnswered(ctx, store, *fresh, now)
 		}
+	}
+	// A weekly steward audit that reported nothing to sample or zero
+	// mismatches has no action for a person even if the agent used
+	// comment_on_issue instead of nothing_needed: close it rather than
+	// leaving it in awaiting_reply and holding next week's schedule.
+	if hasComment && !relayedInProcess && findings == 0 && !pushedInPlace &&
+		isStewardAuditTask(task) && task.NothingNeededAction.Resolved() != model.NothingNeededAck &&
+		stewardAuditCommentInactionable(ctx, store, comment, now) {
+		return finishNothingNeeded(ctx, store, task, runID, now)
 	}
 	if hasComment || findings > 0 || pushedInPlace {
 		return observeField(ctx, store, task.ID, now, func(o *model.Observation) {
