@@ -187,4 +187,54 @@ func TestRunCyclePassesPostRunCompletionTimeToAfterAgentRun(t *testing.T) {
 			t.Fatalf("security review queued -> dispatched = %v, want %v", got, reconcileTick)
 		}
 	})
+
+	t.Run("RunCycle without Config.Now advances monotonically from dispatch clock rather than wall clock", func(t *testing.T) {
+		t.Parallel()
+		store, ctx := openStore(t)
+		sim, client := newSim(t, "acme", "widgets", "main")
+		repo := model.RepoRef{Owner: "acme", Name: "widgets"}
+		task := filedTask(t, ctx, store, "t-synthetic-clock", repo)
+
+		t0 := baseTime
+		fw := agentFunc(func(_ context.Context, _ agent.RunConfig) (*agent.Result, error) {
+			time.Sleep(15 * time.Millisecond)
+			branch := model.BranchName(task.ID)
+			pushBranch(t, sim.BareRepo, branch)
+			pushFile(t, sim.BareRepo, branch, "README.md", "updated\n")
+			return &agent.Result{
+				ToolCalls: []agent.ToolCall{
+					{Name: "run_command", Text: "pushed"},
+					{Name: "comment_on_issue", Arguments: map[string]any{"comment": "Done."}},
+				},
+			}, nil
+		})
+
+		deps := orchestrator.Deps{
+			Store:      store,
+			Client:     client,
+			Sandboxes:  orchestrator.NewHostSandboxes(t.TempDir()),
+			Framework:  orchestrator.StaticFramework(fw),
+			MaxWorkers: 1,
+		}
+		if err := orchestrator.RunCycle(ctx, deps, t0); err != nil {
+			t.Fatalf("RunCycle: %v", err)
+		}
+
+		runs, err := store.Runs(ctx, task.ID)
+		if err != nil || len(runs) != 1 || runs[0].FinishedAt == nil {
+			t.Fatalf("Runs(%s) = (%+v, %v), want 1 finished run", task.ID, runs, err)
+		}
+		if runs[0].FinishedAt.Sub(t0) < 10*time.Millisecond || runs[0].FinishedAt.Sub(t0) > 10*time.Second {
+			t.Fatalf("run.FinishedAt = %v (delta %v from t0=%v), want elapsed runtime on t0 timeline",
+				*runs[0].FinishedAt, runs[0].FinishedAt.Sub(t0), t0)
+		}
+		obs, err := store.GetObservation(ctx, task.ID)
+		if err != nil || obs == nil || obs.CompletedAt == nil {
+			t.Fatalf("GetObservation(%s) = (%+v, %v), want non-nil CompletedAt", task.ID, obs, err)
+		}
+		if obs.CompletedAt.Before(*runs[0].FinishedAt) || obs.CompletedAt.Sub(t0) > 10*time.Second {
+			t.Fatalf("obs.CompletedAt = %v, want >= FinishedAt (%v) on t0 timeline (%v)",
+				*obs.CompletedAt, *runs[0].FinishedAt, t0)
+		}
+	})
 }
