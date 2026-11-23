@@ -2451,6 +2451,17 @@ func runOneWithFramework(ctx context.Context, deps Deps, d dispatch.Dispatch, pr
 	// one setup failure the guard did not cover. A panic is
 	// recoverRunOne's to finish (finishPanickedRun): err is still nil
 	// while one unwinds through here.
+	// Anchor an unset clock to the dispatch timestamp plus monotonic elapsed
+	// time so run and post-run timestamps advance by real elapsed duration in
+	// production without jumping off a synthetic RunCycle clock in tests that
+	// leave Config.Now nil.
+	if deps.Config.Now == nil {
+		wallStart := time.Now()
+		deps.Config.Now = func() time.Time {
+			return now.Add(max(0, time.Since(wallStart)))
+		}
+	}
+
 	runCtx, cancelRun := context.WithCancelCause(context.WithoutCancel(ctx))
 	stopDaemonWatch := context.AfterFunc(ctx, func() { cancelRun(errDaemonStopped) })
 	defer stopDaemonWatch()
