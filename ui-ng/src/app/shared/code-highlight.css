@@ -175,23 +175,27 @@ mark.diff-word {
   color: inherit;
   border-radius: 2px;
   padding: 0 1px;
-  background: rgba(11, 87, 208, 0.16);
+  background: rgba(11, 87, 208, 0.14);
 }
 
 .diff-line-add mark.diff-word {
-  background: rgba(20, 108, 46, 0.24);
+  background: rgba(20, 108, 46, 0.2);
+  color: #084f22;
   font-weight: 600;
 }
 
 .diff-line-del mark.diff-word {
-  background: rgba(179, 38, 30, 0.22);
+  background: rgba(179, 38, 30, 0.2);
+  color: #8c0b0b;
   font-weight: 600;
 }
 
 :root[data-theme="dark"] .diff-line-add mark.diff-word {
-  background: rgba(129, 201, 149, 0.28);
+  background: rgba(129, 201, 149, 0.2);
+  color: #c4eed0;
 }
 
 :root[data-theme="dark"] .diff-line-del mark.diff-word {
-  background: rgba(242, 139, 130, 0.28);
+  background: rgba(242, 139, 130, 0.2);
+  color: #f9dedc;
 }
